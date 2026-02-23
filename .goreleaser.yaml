@@ -5,23 +5,7 @@ before:
     - go mod tidy
 
 builds:
-  - id: spank
-    main: .
-    binary: spank
-    env:
-      - CGO_ENABLED=0
-      - GOPRIVATE=github.com/taigrr/apple-silicon-accelerometer
-    goos:
-      - darwin
-    goarch:
-      - arm64
-    ldflags:
-      - -s -w -X main.version={{.Version}}
-
-  - id: sensord
-    main: ./cmd/sensord
-    binary: sensord
-    env:
+  - env:
       - CGO_ENABLED=0
       - GOPRIVATE=github.com/taigrr/apple-silicon-accelerometer
     goos:

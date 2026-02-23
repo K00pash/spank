@@ -1,4 +1,6 @@
 // spank detects slaps/hits on the laptop and plays audio responses.
+// It reads the Apple Silicon accelerometer directly via IOKit HID —
+// no separate sensor daemon required. Needs sudo.
 package main
 
 import (
@@ -21,6 +23,7 @@ import (
 	"github.com/gopxl/beep/v2/speaker"
 	"github.com/spf13/cobra"
 	"github.com/taigrr/apple-silicon-accelerometer/detector"
+	"github.com/taigrr/apple-silicon-accelerometer/sensor"
 	"github.com/taigrr/apple-silicon-accelerometer/shm"
 )
 
@@ -34,15 +37,21 @@ var sexyAudio embed.FS
 
 var sexyMode bool
 
+// sensorReady is closed once shared memory is created and the sensor
+// worker is about to enter the CFRunLoop.
+var sensorReady = make(chan struct{})
+
+// sensorErr receives any error from the sensor worker.
+var sensorErr = make(chan error, 1)
+
 func main() {
 	cmd := &cobra.Command{
 		Use:   "spank",
 		Short: "Yells 'ow!' when you slap the laptop",
-		Long: `spank reads accelerometer data from shared memory (created by sensord)
+		Long: `spank reads the Apple Silicon accelerometer directly via IOKit HID
 and plays audio responses when a slap or hit is detected.
 
-Requires:
-  - sensord running (with sudo) to provide sensor data
+Requires sudo (for IOKit HID access to the accelerometer).
 
 Use --sexy for a different experience. In sexy mode, the more you slap
 within a minute, the more intense the sounds become.`,
@@ -57,6 +66,116 @@ within a minute, the more intense the sounds become.`,
 
 	if err := fang.Execute(context.Background(), cmd); err != nil {
 		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("spank requires root privileges for accelerometer access, run with: sudo spank")
+	}
+
+	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// Create shared memory for accelerometer data.
+	accelRing, err := shm.CreateRing(shm.NameAccel)
+	if err != nil {
+		return fmt.Errorf("creating accel shm: %w", err)
+	}
+	defer accelRing.Close()
+	defer accelRing.Unlink()
+
+	// Start the sensor worker in a background goroutine.
+	// sensor.Run() needs runtime.LockOSThread for CFRunLoop, which it
+	// handles internally. We launch detection on the current goroutine.
+	go func() {
+		close(sensorReady)
+		err := sensor.Run(sensor.Config{
+			AccelRing: accelRing,
+			Restarts:  0,
+		})
+		if err != nil {
+			sensorErr <- err
+		}
+	}()
+
+	// Wait for sensor to be ready.
+	select {
+	case <-sensorReady:
+	case err := <-sensorErr:
+		return fmt.Errorf("sensor worker failed: %w", err)
+	case <-ctx.Done():
+		return nil
+	}
+
+	// Give the sensor a moment to start producing data.
+	time.Sleep(100 * time.Millisecond)
+
+	painFiles, err := loadPainFiles()
+	if err != nil {
+		return fmt.Errorf("loading pain audio: %w", err)
+	}
+
+	tracker := newSlapTracker()
+	speakerInit := false
+	det := detector.New()
+	var lastAccelTotal uint64
+	lastYell := time.Time{}
+	cooldown := 500 * time.Millisecond
+	maxBatch := 200
+
+	mode := "pain"
+	if sexyMode {
+		mode = "sexy"
+	}
+	fmt.Printf("spank: listening for slaps in %s mode... (ctrl+c to quit)\n", mode)
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("\nbye!")
+			return nil
+		case err := <-sensorErr:
+			return fmt.Errorf("sensor worker failed: %w", err)
+		case <-ticker.C:
+		}
+
+		now := time.Now()
+		tNow := float64(now.UnixNano()) / 1e9
+
+		samples, newTotal := accelRing.ReadNew(lastAccelTotal, shm.AccelScale)
+		lastAccelTotal = newTotal
+		if len(samples) > maxBatch {
+			samples = samples[len(samples)-maxBatch:]
+		}
+
+		prevEventCount := len(det.Events)
+		nSamples := len(samples)
+		for idx, s := range samples {
+			tSample := tNow - float64(nSamples-idx-1)/float64(det.FS)
+			det.Process(s.X, s.Y, s.Z, tSample)
+		}
+
+		if len(det.Events) > prevEventCount && time.Since(lastYell) > cooldown {
+			ev := det.Events[len(det.Events)-1]
+			if ev.Severity == "CHOC_MAJEUR" || ev.Severity == "CHOC_MOYEN" || ev.Severity == "MICRO_CHOC" {
+				lastYell = now
+				count := tracker.record(now)
+
+				if sexyMode {
+					file := tracker.getSexyFile(count)
+					fmt.Printf("slap #%d [%s amp=%.5fg] -> %s\n", count, ev.Severity, ev.Amplitude, file)
+					go playEmbedded(sexyAudio, file, &speakerInit)
+				} else {
+					file := painFiles[rand.Intn(len(painFiles))]
+					fmt.Printf("ouch! [%s amp=%.5fg]\n", ev.Severity, ev.Amplitude)
+					go playEmbedded(painAudio, file, &speakerInit)
+				}
+			}
+		}
 	}
 }
 
@@ -131,82 +250,6 @@ func (st *slapTracker) getSexyFile(count int) string {
 	return st.sexyFiles[idx]
 }
 
-func run(ctx context.Context) error {
-	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
-
-	accelRing, err := shm.OpenRing(shm.NameAccel)
-	if err != nil {
-		return fmt.Errorf("opening accel shm (is sensord running?): %w", err)
-	}
-	defer accelRing.Close()
-
-	painFiles, err := loadPainFiles()
-	if err != nil {
-		return fmt.Errorf("loading pain audio: %w", err)
-	}
-
-	tracker := newSlapTracker()
-	speakerInit := false
-	det := detector.New()
-	var lastAccelTotal uint64
-	lastYell := time.Time{}
-	cooldown := 500 * time.Millisecond
-	maxBatch := 200
-
-	mode := "pain"
-	if sexyMode {
-		mode = "sexy"
-	}
-	fmt.Printf("spank: listening for slaps in %s mode... (ctrl+c to quit)\n", mode)
-
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Println("\nbye!")
-			return nil
-		case <-ticker.C:
-		}
-
-		now := time.Now()
-		tNow := float64(now.UnixNano()) / 1e9
-
-		samples, newTotal := accelRing.ReadNew(lastAccelTotal, shm.AccelScale)
-		lastAccelTotal = newTotal
-		if len(samples) > maxBatch {
-			samples = samples[len(samples)-maxBatch:]
-		}
-
-		prevEventCount := len(det.Events)
-		nSamples := len(samples)
-		for idx, s := range samples {
-			tSample := tNow - float64(nSamples-idx-1)/float64(det.FS)
-			det.Process(s.X, s.Y, s.Z, tSample)
-		}
-
-		if len(det.Events) > prevEventCount && time.Since(lastYell) > cooldown {
-			ev := det.Events[len(det.Events)-1]
-			if ev.Severity == "CHOC_MAJEUR" || ev.Severity == "CHOC_MOYEN" || ev.Severity == "MICRO_CHOC" {
-				lastYell = now
-				count := tracker.record(now)
-
-				if sexyMode {
-					file := tracker.getSexyFile(count)
-					fmt.Printf("slap #%d [%s amp=%.5fg] -> %s\n", count, ev.Severity, ev.Amplitude, file)
-					go playEmbedded(sexyAudio, file, &speakerInit)
-				} else {
-					file := painFiles[rand.Intn(len(painFiles))]
-					fmt.Printf("ouch! [%s amp=%.5fg]\n", ev.Severity, ev.Amplitude)
-					go playEmbedded(painAudio, file, &speakerInit)
-				}
-			}
-		}
-	}
-}
-
 func loadPainFiles() ([]string, error) {
 	entries, err := painAudio.ReadDir("audio/pain")
 	if err != nil {
@@ -221,9 +264,7 @@ func loadPainFiles() ([]string, error) {
 	return files, nil
 }
 
-var (
-	speakerMu sync.Mutex
-)
+var speakerMu sync.Mutex
 
 func playEmbedded(fs embed.FS, path string, speakerInit *bool) {
 	data, err := fs.ReadFile(path)

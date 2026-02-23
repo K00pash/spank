@@ -2,34 +2,31 @@
 
 Slap your MacBook, it yells back.
 
-Uses the Apple Silicon accelerometer (Bosch BMI286 IMU via IOKit HID) to detect physical hits on your laptop and plays audio responses.
+Uses the Apple Silicon accelerometer (Bosch BMI286 IMU via IOKit HID) to detect physical hits on your laptop and plays audio responses. Single binary, no dependencies.
 
 ## Requirements
 
-- macOS on Apple Silicon
+- macOS on Apple Silicon (M2+)
+- `sudo` (for IOKit HID accelerometer access)
 
 ## Install
 
-Download both `spank` and `sensord` from the [latest release](https://github.com/taigrr/spank/releases/latest).
+Download from the [latest release](https://github.com/taigrr/spank/releases/latest).
 
 Or build from source:
 
 ```bash
 GOPRIVATE=github.com/taigrr/apple-silicon-accelerometer go install github.com/taigrr/spank@latest
-GOPRIVATE=github.com/taigrr/apple-silicon-accelerometer go install github.com/taigrr/spank/cmd/sensord@latest
 ```
 
 ## Usage
 
 ```bash
-# Start sensor daemon first (in another terminal)
-sudo sensord
-
 # Normal mode — says "ow!" when slapped
-spank
+sudo spank
 
 # Sexy mode — escalating responses based on slap frequency
-spank --sexy
+sudo spank --sexy
 ```
 
 ### Modes
@@ -40,8 +37,8 @@ spank --sexy
 
 ## How it works
 
-1. `sensord` reads raw accelerometer data via IOKit HID and writes to POSIX shared memory
-2. `spank` reads from shared memory and runs vibration detection (STA/LTA, CUSUM, kurtosis, peak/MAD)
+1. Reads raw accelerometer data directly via IOKit HID (Apple SPU sensor)
+2. Runs vibration detection (STA/LTA, CUSUM, kurtosis, peak/MAD)
 3. When a significant impact is detected, plays an embedded MP3 response
 4. 500ms cooldown between responses to prevent rapid-fire
 
