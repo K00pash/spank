@@ -42,6 +42,10 @@ sudo spank --sexy
 3. When a significant impact is detected, plays an embedded MP3 response
 4. 500ms cooldown between responses to prevent rapid-fire
 
+## Credits
+
+Sensor reading and vibration detection ported from [olvvier/apple-silicon-accelerometer](https://github.com/olvvier/apple-silicon-accelerometer).
+
 ## License
 
-0BSD
+MIT
