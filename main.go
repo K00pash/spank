@@ -35,7 +35,13 @@ var painAudio embed.FS
 //go:embed audio/sexy/*.mp3
 var sexyAudio embed.FS
 
-var sexyMode bool
+//go:embed audio/halo/*.mp3
+var haloAudio embed.FS
+
+var (
+	sexyMode bool
+	haloMode bool
+)
 
 // sensorReady is closed once shared memory is created and the sensor
 // worker is about to enter the CFRunLoop.
@@ -43,6 +49,104 @@ var sensorReady = make(chan struct{})
 
 // sensorErr receives any error from the sensor worker.
 var sensorErr = make(chan error, 1)
+
+type playMode int
+
+const (
+	modeRandom     playMode = iota
+	modeEscalation
+)
+
+type soundPack struct {
+	name  string
+	fs    embed.FS
+	dir   string
+	mode  playMode
+	files []string
+}
+
+func (sp *soundPack) loadFiles() error {
+	entries, err := sp.fs.ReadDir(sp.dir)
+	if err != nil {
+		return err
+	}
+	sp.files = make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			sp.files = append(sp.files, sp.dir+"/"+e.Name())
+		}
+	}
+	sort.Strings(sp.files)
+	return nil
+}
+
+type slapTracker struct {
+	mu     sync.Mutex
+	times  []time.Time
+	window time.Duration
+	pack   *soundPack
+	altIdx int
+}
+
+func newSlapTracker(pack *soundPack) *slapTracker {
+	return &slapTracker{
+		window: 5 * time.Minute,
+		pack:   pack,
+	}
+}
+
+func (st *slapTracker) record(t time.Time) int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	cutoff := t.Add(-st.window)
+	newTimes := make([]time.Time, 0, len(st.times)+1)
+	for _, tt := range st.times {
+		if tt.After(cutoff) {
+			newTimes = append(newTimes, tt)
+		}
+	}
+	newTimes = append(newTimes, t)
+	st.times = newTimes
+	return len(st.times)
+}
+
+func (st *slapTracker) getFile(count int) string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if len(st.pack.files) == 0 {
+		return ""
+	}
+
+	if st.pack.mode == modeRandom {
+		return st.pack.files[rand.Intn(len(st.pack.files))]
+	}
+
+	// Escalation mode
+	maxIdx := len(st.pack.files) - 1
+	topTwo := maxIdx - 1
+	if topTwo < 0 {
+		topTwo = 0
+	}
+
+	var idx int
+	if count >= 20 {
+		st.altIdx = 1 - st.altIdx
+		idx = topTwo + st.altIdx
+	} else {
+		ratio := float64(count) / 20.0
+		if ratio > 1 {
+			ratio = 1
+		}
+		idx = int(ratio * float64(topTwo))
+	}
+
+	if idx > maxIdx {
+		idx = maxIdx
+	}
+	return st.pack.files[idx]
+}
 
 func main() {
 	cmd := &cobra.Command{
@@ -54,7 +158,9 @@ and plays audio responses when a slap or hit is detected.
 Requires sudo (for IOKit HID access to the accelerometer).
 
 Use --sexy for a different experience. In sexy mode, the more you slap
-within a minute, the more intense the sounds become.`,
+within a minute, the more intense the sounds become.
+
+Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 		Version: version,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return run(cmd.Context())
@@ -63,6 +169,7 @@ within a minute, the more intense the sounds become.`,
 	}
 
 	cmd.Flags().BoolVarP(&sexyMode, "sexy", "s", false, "Enable sexy mode")
+	cmd.Flags().BoolVarP(&haloMode, "halo", "H", false, "Enable halo mode")
 
 	if err := fang.Execute(context.Background(), cmd); err != nil {
 		os.Exit(1)
@@ -72,6 +179,24 @@ within a minute, the more intense the sounds become.`,
 func run(ctx context.Context) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("spank requires root privileges for accelerometer access, run with: sudo spank")
+	}
+
+	if sexyMode && haloMode {
+		return fmt.Errorf("--sexy and --halo are mutually exclusive; pick one")
+	}
+
+	var pack *soundPack
+	switch {
+	case sexyMode:
+		pack = &soundPack{name: "sexy", fs: sexyAudio, dir: "audio/sexy", mode: modeEscalation}
+	case haloMode:
+		pack = &soundPack{name: "halo", fs: haloAudio, dir: "audio/halo", mode: modeRandom}
+	default:
+		pack = &soundPack{name: "pain", fs: painAudio, dir: "audio/pain", mode: modeRandom}
+	}
+
+	if err := pack.loadFiles(); err != nil {
+		return fmt.Errorf("loading %s audio: %w", pack.name, err)
 	}
 
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
@@ -111,12 +236,7 @@ func run(ctx context.Context) error {
 	// Give the sensor a moment to start producing data.
 	time.Sleep(100 * time.Millisecond)
 
-	painFiles, err := loadPainFiles()
-	if err != nil {
-		return fmt.Errorf("loading pain audio: %w", err)
-	}
-
-	tracker := newSlapTracker()
+	tracker := newSlapTracker(pack)
 	speakerInit := false
 	det := detector.New()
 	var lastAccelTotal uint64
@@ -124,11 +244,7 @@ func run(ctx context.Context) error {
 	cooldown := 500 * time.Millisecond
 	maxBatch := 200
 
-	mode := "pain"
-	if sexyMode {
-		mode = "sexy"
-	}
-	fmt.Printf("spank: listening for slaps in %s mode... (ctrl+c to quit)\n", mode)
+	fmt.Printf("spank: listening for slaps in %s mode... (ctrl+c to quit)\n", pack.name)
 
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -164,104 +280,12 @@ func run(ctx context.Context) error {
 			if ev.Severity == "CHOC_MAJEUR" || ev.Severity == "CHOC_MOYEN" || ev.Severity == "MICRO_CHOC" {
 				lastYell = now
 				count := tracker.record(now)
-
-				if sexyMode {
-					file := tracker.getSexyFile(count)
-					fmt.Printf("slap #%d [%s amp=%.5fg] -> %s\n", count, ev.Severity, ev.Amplitude, file)
-					go playEmbedded(sexyAudio, file, &speakerInit)
-				} else {
-					file := painFiles[rand.Intn(len(painFiles))]
-					fmt.Printf("ouch! [%s amp=%.5fg]\n", ev.Severity, ev.Amplitude)
-					go playEmbedded(painAudio, file, &speakerInit)
-				}
+				file := tracker.getFile(count)
+				fmt.Printf("slap #%d [%s amp=%.5fg] -> %s\n", count, ev.Severity, ev.Amplitude, file)
+				go playEmbedded(pack.fs, file, &speakerInit)
 			}
 		}
 	}
-}
-
-type slapTracker struct {
-	mu        sync.Mutex
-	times     []time.Time
-	window    time.Duration
-	sexyFiles []string
-	altIdx    int
-}
-
-func newSlapTracker() *slapTracker {
-	entries, _ := sexyAudio.ReadDir("audio/sexy")
-	files := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() {
-			files = append(files, "audio/sexy/"+e.Name())
-		}
-	}
-	sort.Strings(files)
-	return &slapTracker{
-		window:    5 * time.Minute,
-		sexyFiles: files,
-	}
-}
-
-func (st *slapTracker) record(t time.Time) int {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-
-	cutoff := t.Add(-st.window)
-	newTimes := make([]time.Time, 0, len(st.times)+1)
-	for _, tt := range st.times {
-		if tt.After(cutoff) {
-			newTimes = append(newTimes, tt)
-		}
-	}
-	newTimes = append(newTimes, t)
-	st.times = newTimes
-	return len(st.times)
-}
-
-func (st *slapTracker) getSexyFile(count int) string {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-
-	if len(st.sexyFiles) == 0 {
-		return ""
-	}
-
-	maxIdx := len(st.sexyFiles) - 1
-	topTwo := maxIdx - 1
-	if topTwo < 0 {
-		topTwo = 0
-	}
-
-	var idx int
-	if count >= 20 {
-		st.altIdx = 1 - st.altIdx
-		idx = topTwo + st.altIdx
-	} else {
-		ratio := float64(count) / 20.0
-		if ratio > 1 {
-			ratio = 1
-		}
-		idx = int(ratio * float64(topTwo))
-	}
-
-	if idx > maxIdx {
-		idx = maxIdx
-	}
-	return st.sexyFiles[idx]
-}
-
-func loadPainFiles() ([]string, error) {
-	entries, err := painAudio.ReadDir("audio/pain")
-	if err != nil {
-		return nil, err
-	}
-	files := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() {
-			files = append(files, "audio/pain/"+e.Name())
-		}
-	}
-	return files, nil
 }
 
 var speakerMu sync.Mutex
