@@ -240,7 +240,7 @@ func run(ctx context.Context) error {
 	speakerInit := false
 	det := detector.New()
 	var lastAccelTotal uint64
-	lastEventIdx := 0
+	var lastEventTime time.Time
 	lastYell := time.Time{}
 	cooldown := 500 * time.Millisecond
 	maxBatch := 200
@@ -276,16 +276,18 @@ func run(ctx context.Context) error {
 		}
 
 		newEventIdx := len(det.Events)
-		if newEventIdx != lastEventIdx {
+		if newEventIdx > 0 {
 			ev := det.Events[newEventIdx-1]
-			lastEventIdx = newEventIdx
-			if time.Since(lastYell) > cooldown {
-				if ev.Severity == "CHOC_MAJEUR" || ev.Severity == "CHOC_MOYEN" || ev.Severity == "MICRO_CHOC" {
-					lastYell = now
-					count := tracker.record(now)
-					file := tracker.getFile(count)
-					fmt.Printf("slap #%d [%s amp=%.5fg] -> %s\n", count, ev.Severity, ev.Amplitude, file)
-					go playEmbedded(pack.fs, file, &speakerInit)
+			if ev.Time != lastEventTime {
+				lastEventTime = ev.Time
+				if time.Since(lastYell) > cooldown {
+					if ev.Severity == "CHOC_MAJEUR" || ev.Severity == "CHOC_MOYEN" || ev.Severity == "MICRO_CHOC" {
+						lastYell = now
+						count := tracker.record(now)
+						file := tracker.getFile(count)
+						fmt.Printf("slap #%d [%s amp=%.5fg] -> %s\n", count, ev.Severity, ev.Amplitude, file)
+						go playEmbedded(pack.fs, file, &speakerInit)
+					}
 				}
 			}
 		}
