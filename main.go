@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -62,6 +63,13 @@ type ApprovalRequest struct {
 
 // pendingApproval is a buffered channel for at most one pending request.
 var pendingApproval = make(chan ApprovalRequest, 1)
+
+// awaitingSlap gates shock processing: only handle slaps after a request arrives.
+var awaitingSlap atomic.Bool
+
+// requestArrived records when the current permission request was enqueued,
+// so the main loop can ignore stale accelerometer events from before the request.
+var requestArrived atomic.Int64
 
 type soundPack struct {
 	name  string
@@ -174,7 +182,9 @@ func hookHandler(w http.ResponseWriter, r *http.Request) {
 	// Try to enqueue — if channel is full (another request pending), fallback.
 	select {
 	case pendingApproval <- approval:
-		// Queued successfully.
+		// Queued successfully — start listening for slaps.
+		requestArrived.Store(time.Now().UnixNano())
+		awaitingSlap.Store(true)
 	default:
 		// Already a pending request — return empty 200 (fallback to terminal).
 		fmt.Println("hook: another request already pending, falling back to terminal")
@@ -198,6 +208,7 @@ func hookHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case <-time.After(30 * time.Second):
+		awaitingSlap.Store(false)
 		// Drain the pending request so the main loop doesn't hold a stale one.
 		select {
 		case <-pendingApproval:
@@ -332,17 +343,26 @@ func run(ctx context.Context) error {
 				lastEventTime = ev.Time
 				if time.Since(lastYell) > cooldown {
 					if ev.Severity == "CHOC_MAJEUR" || ev.Severity == "CHOC_MOYEN" {
+						// Only process slaps when a permission request is pending.
+						if !awaitingSlap.Load() {
+							continue
+						}
+						// Ignore events that occurred before the request arrived.
+						reqTime := time.Unix(0, requestArrived.Load())
+						if ev.Time.Before(reqTime) {
+							continue
+						}
 						lastYell = now
 
 						// Check if there's a pending approval request.
 						select {
 						case approval := <-pendingApproval:
+							awaitingSlap.Store(false)
 							file := pack.randomFile()
 							fmt.Printf("slap detected [%s amp=%.5fg] -> approved! playing %s\n", ev.Severity, ev.Amplitude, file)
 							go playEmbedded(pack.fs, file)
 							approval.Response <- "allow"
 						default:
-							// No pending request — ignore the slap silently.
 						}
 					}
 				}
