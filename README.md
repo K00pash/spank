@@ -1,8 +1,8 @@
 # spank-claude
 
-Approve Claude Code actions by slapping your laptop.
+Approve Claude Code tool calls by physically slapping your MacBook.
 
-Fork of [taigrr/spank](https://github.com/taigrr/spank) — converted from a standalone slap-to-sound toy into an HTTP server that integrates with [Claude Code hooks](https://docs.anthropic.com/en/docs/claude-code/hooks).
+Fork of [taigrr/spank](https://github.com/taigrr/spank) — the accelerometer-based slap detector, repurposed as an HTTP approval server for [Claude Code hooks](https://docs.anthropic.com/en/docs/claude-code/hooks).
 
 ## How it works
 
@@ -11,23 +11,23 @@ Claude Code requests permission (e.g. run a bash command)
         ↓
 POST → spank HTTP server (localhost:19222)
         ↓
-🔔 Plays notification sound ("slap me")
+🔔 macOS Ping notification sound
         ↓
 👋 You slap the laptop
         ↓
-🔊 Plays approval sound (pain/sexy/halo)
+🔊 Approval sound from selected pack (pain/sexy/halo)
 ✅ Returns {"decision": {"behavior": "allow"}}
         ↓
 Claude Code continues
 ```
 
-No slap within 30 seconds → Claude Code falls back to the normal terminal prompt.
-Slaps without a pending request are silently ignored.
+- No slap within 30 seconds → empty response → Claude Code shows the normal terminal prompt
+- Slaps without a pending request are silently ignored
 
 ## Requirements
 
 - macOS on Apple Silicon (M2+)
-- [Go](https://go.dev/) (for building from source)
+- [Go](https://go.dev/) (for building; installer will install it via Homebrew if missing)
 
 ## Quick install
 
@@ -37,45 +37,52 @@ cd spank
 ./install.sh
 ```
 
-That's it. The script handles everything:
+The script handles everything:
 - Builds the binary and copies it to `/usr/local/bin/`
 - Sets up passwordless `sudo` for spank (IOKit HID needs root)
-- Configures Claude Code hooks (`~/.claude/settings.json`)
+- Configures Claude Code hooks in `~/.claude/settings.json`
 - Starts spank in the background
 
-### Options
+Choose a sound pack:
 
 ```bash
-# Choose sound pack (default: sexy)
-./install.sh --sound pain
-./install.sh --sound sexy
-./install.sh --sound halo
+./install.sh --sound pain   # "Ow!", "Ouch!", "Hey that hurts!"
+./install.sh --sound sexy   # moans and groans (default)
+./install.sh --sound halo   # Halo death sounds
 ```
+
+After install, just start Claude Code — spank launches automatically via SessionStart hook.
 
 ## Sound packs
 
-| Pack | Description |
-|------|-------------|
-| **pain** | "Ow!", "Ouch!", "Hey that hurts!" — 10 clips |
-| **sexy** | Escalating moans — 60 clips |
-| **halo** | Halo death sounds — 9 clips |
+| Pack | Clips | Description |
+|------|-------|-------------|
+| **pain** | 10 | "Ow!", "Ouch!", "Hey that hurts!", "Yowch!" |
+| **sexy** | 60 | Random moans and groans |
+| **halo** | 9 | Halo game death sounds |
 
 ## Manual usage
 
 ```bash
-# Start the server (requires sudo for accelerometer)
+# Start the server (requires sudo for accelerometer access)
 sudo spank --sound sexy
 
 # Custom port
 sudo spank --sound pain --port 8080
-
-# Test with curl
-curl -X POST http://127.0.0.1:19222/hook -d '{"hook_event_name":"PermissionRequest","tool_name":"Bash"}'
 ```
 
-## Claude Code configuration
+Test with curl (in another terminal):
 
-The installer adds this to `~/.claude/settings.json`:
+```bash
+curl -X POST http://127.0.0.1:19222/hook \
+  -d '{"hook_event_name":"PermissionRequest","tool_name":"Bash"}'
+```
+
+You should hear a Ping → slap the laptop → curl receives the approval JSON.
+
+## What the installer configures
+
+Two hooks in `~/.claude/settings.json`:
 
 ```json
 {
@@ -105,39 +112,34 @@ The installer adds this to `~/.claude/settings.json`:
 }
 ```
 
-- **SessionStart** hook ensures spank is running when Claude Code starts
-- **PermissionRequest** hook sends every permission request to spank
+- **SessionStart** — ensures spank is running when you launch Claude Code
+- **PermissionRequest** — routes every tool permission request through spank
 
 ## Uninstall
 
 ```bash
-# Remove binary
 sudo rm /usr/local/bin/spank
-
-# Remove sudoers rule
 sudo rm /etc/sudoers.d/spank
-
-# Remove hooks from ~/.claude/settings.json (edit manually)
-
-# Stop running instance
 sudo pkill -f /usr/local/bin/spank
+# Remove hooks from ~/.claude/settings.json manually
 ```
 
-## Differences from the original
+## Differences from the original spank
 
-| Original spank | This fork |
-|----------------|-----------|
-| Plays sounds on every slap | Sounds **only on Claude Code approve** |
+| Original | This fork |
+|----------|-----------|
+| Plays sounds on every slap | Sounds **only** when approving Claude Code actions |
 | Standalone CLI toy | HTTP server for Claude Code hooks |
 | `--sexy` / `--halo` flags | `--sound pain\|sexy\|halo` flag |
-| No HTTP server | `POST /hook` endpoint on localhost |
+| No network | `POST /hook` endpoint on localhost |
+| Always listening | Ignores slaps when no permission request is pending |
 
-Reused from the original: accelerometer detection, sound packs, IOKit HID sensor, beep audio playback.
+Reused from the original: accelerometer detection via IOKit HID, sound packs, beep audio playback.
 
 ## Credits
 
 - Original [spank](https://github.com/taigrr/spank) by [@taigrr](https://github.com/taigrr)
-- Sensor reading from [apple-silicon-accelerometer](https://github.com/olvvier/apple-silicon-accelerometer)
+- Sensor and detection from [apple-silicon-accelerometer](https://github.com/olvvier/apple-silicon-accelerometer)
 
 ## License
 
