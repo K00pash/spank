@@ -340,18 +340,14 @@ func run(ctx context.Context) error {
 		if newEventIdx > 0 {
 			ev := det.Events[newEventIdx-1]
 			if ev.Time != lastEventTime {
-				lastEventTime = ev.Time
 				if time.Since(lastYell) > cooldown {
 					if ev.Severity == "CHOC_MAJEUR" || ev.Severity == "CHOC_MOYEN" {
 						// Only process slaps when a permission request is pending.
 						if !awaitingSlap.Load() {
+							lastEventTime = ev.Time
 							continue
 						}
-						// Ignore events that occurred before the request arrived.
-						reqTime := time.Unix(0, requestArrived.Load())
-						if ev.Time.Before(reqTime) {
-							continue
-						}
+						lastEventTime = ev.Time
 						lastYell = now
 
 						// Check if there's a pending approval request.
