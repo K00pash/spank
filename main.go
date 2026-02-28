@@ -67,10 +67,6 @@ var pendingApproval = make(chan ApprovalRequest, 1)
 // awaitingSlap gates shock processing: only handle slaps after a request arrives.
 var awaitingSlap atomic.Bool
 
-// requestArrived records when the current permission request was enqueued,
-// so the main loop can ignore stale accelerometer events from before the request.
-var requestArrived atomic.Int64
-
 type soundPack struct {
 	name  string
 	fs    embed.FS
@@ -183,7 +179,6 @@ func hookHandler(w http.ResponseWriter, r *http.Request) {
 	select {
 	case pendingApproval <- approval:
 		// Queued successfully — start listening for slaps.
-		requestArrived.Store(time.Now().UnixNano())
 		awaitingSlap.Store(true)
 	default:
 		// Already a pending request — return empty 200 (fallback to terminal).
