@@ -14,6 +14,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sort"
 	"sync"
@@ -40,9 +41,6 @@ var sexyAudio embed.FS
 
 //go:embed audio/halo/*.mp3
 var haloAudio embed.FS
-
-//go:embed audio/notify/*.mp3
-var notifyAudio embed.FS
 
 var (
 	port      int
@@ -163,8 +161,8 @@ func hookHandler(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Printf("hook: permission request for tool=%s, waiting for slap...\n", req.ToolName)
 
-	// Play notification sound.
-	go playEmbedded(notifyAudio, "audio/notify/waiting.mp3")
+	// Play macOS system notification sound.
+	go exec.Command("afplay", "/System/Library/Sounds/Ping.aiff").Run()
 
 	// Create approval request.
 	respCh := make(chan string, 1)
@@ -333,7 +331,7 @@ func run(ctx context.Context) error {
 			if ev.Time != lastEventTime {
 				lastEventTime = ev.Time
 				if time.Since(lastYell) > cooldown {
-					if ev.Severity == "CHOC_MAJEUR" || ev.Severity == "CHOC_MOYEN" || ev.Severity == "MICRO_CHOC" {
+					if ev.Severity == "CHOC_MAJEUR" || ev.Severity == "CHOC_MOYEN" {
 						lastYell = now
 
 						// Check if there's a pending approval request.
