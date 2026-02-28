@@ -1,176 +1,143 @@
-# spank
+# spank-claude
 
-Slap your MacBook, it yells back.
+Approve Claude Code actions by slapping your laptop.
 
-> "this is the most amazing thing i've ever seen" — [@kenwheeler](https://x.com/kenwheeler)
+Fork of [taigrr/spank](https://github.com/taigrr/spank) — converted from a standalone slap-to-sound toy into an HTTP server that integrates with [Claude Code hooks](https://docs.anthropic.com/en/docs/claude-code/hooks).
 
-> "I just ran sexy mode with my wife sitting next to me...We died laughing" — [@duncanthedev](https://x.com/duncanthedev)
+## How it works
 
-> "peak engineering" — [@tylertaewook](https://x.com/tylertaewook)
+```
+Claude Code requests permission (e.g. run a bash command)
+        ↓
+POST → spank HTTP server (localhost:19222)
+        ↓
+🔔 Plays notification sound ("slap me")
+        ↓
+👋 You slap the laptop
+        ↓
+🔊 Plays approval sound (pain/sexy/halo)
+✅ Returns {"decision": {"behavior": "allow"}}
+        ↓
+Claude Code continues
+```
 
-Uses the Apple Silicon accelerometer (Bosch BMI286 IMU via IOKit HID) to detect physical hits on your laptop and plays audio responses. Single binary, no dependencies.
+No slap within 30 seconds → Claude Code falls back to the normal terminal prompt.
+Slaps without a pending request are silently ignored.
 
 ## Requirements
 
 - macOS on Apple Silicon (M2+)
-- `sudo` (for IOKit HID accelerometer access)
+- [Go](https://go.dev/) (for building from source)
 
-## Install
-
-Download from the [latest release](https://github.com/taigrr/spank/releases/latest).
-
-Or build from source:
+## Quick install
 
 ```bash
-go install github.com/taigrr/spank@latest
+git clone https://github.com/K00pash/spank.git
+cd spank
+./install.sh
 ```
 
-## Usage
+That's it. The script handles everything:
+- Builds the binary and copies it to `/usr/local/bin/`
+- Sets up passwordless `sudo` for spank (IOKit HID needs root)
+- Configures Claude Code hooks (`~/.claude/settings.json`)
+- Starts spank in the background
+
+### Options
 
 ```bash
-# Normal mode — says "ow!" when slapped
-sudo spank
-
-# Sexy mode — escalating responses based on slap frequency
-sudo spank --sexy
-
-# Halo mode — plays Halo death sounds when slapped
-sudo spank --halo
+# Choose sound pack (default: sexy)
+./install.sh --sound pain
+./install.sh --sound sexy
+./install.sh --sound halo
 ```
 
-### Modes
+## Sound packs
 
-**Pain mode** (default): Randomly plays from 10 pain/protest audio clips when a slap is detected.
+| Pack | Description |
+|------|-------------|
+| **pain** | "Ow!", "Ouch!", "Hey that hurts!" — 10 clips |
+| **sexy** | Escalating moans — 60 clips |
+| **halo** | Halo death sounds — 9 clips |
 
-**Sexy mode** (`--sexy`): Tracks slaps within a rolling 5-minute window. The more you slap, the more intense the audio response. 60 levels of escalation.
-
-**Halo mode** (`--halo`): Randomly plays from death sound effects from the Halo video game series when a slap is detected.
-
-## Running as a Service
-
-To have spank start automatically at boot, create a launchd plist. Pick your mode:
-
-<details>
-<summary>Pain mode (default)</summary>
+## Manual usage
 
 ```bash
-sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.taigrr.spank</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/spank</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/spank.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/spank.err</string>
-</dict>
-</plist>
-EOF
+# Start the server (requires sudo for accelerometer)
+sudo spank --sound sexy
+
+# Custom port
+sudo spank --sound pain --port 8080
+
+# Test with curl
+curl -X POST http://127.0.0.1:19222/hook -d '{"hook_event_name":"PermissionRequest","tool_name":"Bash"}'
 ```
 
-</details>
+## Claude Code configuration
 
-<details>
-<summary>Sexy mode</summary>
+The installer adds this to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/spank/ensure-running.sh"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:19222/hook",
+            "timeout": 35
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+- **SessionStart** hook ensures spank is running when Claude Code starts
+- **PermissionRequest** hook sends every permission request to spank
+
+## Uninstall
 
 ```bash
-sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.taigrr.spank</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/spank</string>
-        <string>--sexy</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/spank.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/spank.err</string>
-</dict>
-</plist>
-EOF
+# Remove binary
+sudo rm /usr/local/bin/spank
+
+# Remove sudoers rule
+sudo rm /etc/sudoers.d/spank
+
+# Remove hooks from ~/.claude/settings.json (edit manually)
+
+# Stop running instance
+sudo pkill -f /usr/local/bin/spank
 ```
 
-</details>
+## Differences from the original
 
-<details>
-<summary>Halo mode</summary>
+| Original spank | This fork |
+|----------------|-----------|
+| Plays sounds on every slap | Sounds **only on Claude Code approve** |
+| Standalone CLI toy | HTTP server for Claude Code hooks |
+| `--sexy` / `--halo` flags | `--sound pain\|sexy\|halo` flag |
+| No HTTP server | `POST /hook` endpoint on localhost |
 
-```bash
-sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.taigrr.spank</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/spank</string>
-        <string>--halo</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/spank.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/spank.err</string>
-</dict>
-</plist>
-EOF
-```
-
-</details>
-
-> **Note:** Update the path to `spank` if you installed it elsewhere (e.g. `~/go/bin/spank`).
-
-Load and start the service:
-
-```bash
-sudo launchctl load /Library/LaunchDaemons/com.taigrr.spank.plist
-```
-
-Since the plist lives in `/Library/LaunchDaemons` and no `UserName` key is set, launchd runs it as root — no `sudo` needed.
-
-To stop or unload:
-
-```bash
-sudo launchctl unload /Library/LaunchDaemons/com.taigrr.spank.plist
-```
-
-## How it works
-
-1. Reads raw accelerometer data directly via IOKit HID (Apple SPU sensor)
-2. Runs vibration detection (STA/LTA, CUSUM, kurtosis, peak/MAD)
-3. When a significant impact is detected, plays an embedded MP3 response
-4. 500ms cooldown between responses to prevent rapid-fire
+Reused from the original: accelerometer detection, sound packs, IOKit HID sensor, beep audio playback.
 
 ## Credits
 
-Sensor reading and vibration detection ported from [olvvier/apple-silicon-accelerometer](https://github.com/olvvier/apple-silicon-accelerometer).
+- Original [spank](https://github.com/taigrr/spank) by [@taigrr](https://github.com/taigrr)
+- Sensor reading from [apple-silicon-accelerometer](https://github.com/olvvier/apple-silicon-accelerometer)
 
 ## License
 
