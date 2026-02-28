@@ -1,15 +1,18 @@
-// spank detects slaps/hits on the laptop and plays audio responses.
-// It reads the Apple Silicon accelerometer directly via IOKit HID —
-// no separate sensor daemon required. Needs sudo.
+// spank-claude: approve Claude Code actions by slapping your laptop.
+// Reads the Apple Silicon accelerometer via IOKit HID and runs an HTTP
+// server that integrates with Claude Code hooks (PermissionRequest).
+// Needs sudo.
 package main
 
 import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -38,9 +41,12 @@ var sexyAudio embed.FS
 //go:embed audio/halo/*.mp3
 var haloAudio embed.FS
 
+//go:embed audio/notify/*.mp3
+var notifyAudio embed.FS
+
 var (
-	sexyMode bool
-	haloMode bool
+	port      int
+	soundPkgF string // "pain", "sexy", or "halo"
 )
 
 // sensorReady is closed once shared memory is created and the sensor
@@ -50,18 +56,19 @@ var sensorReady = make(chan struct{})
 // sensorErr receives any error from the sensor worker.
 var sensorErr = make(chan error, 1)
 
-type playMode int
+// ApprovalRequest represents a pending Claude Code permission request.
+type ApprovalRequest struct {
+	ToolName string
+	Response chan string // "allow" or "" (timeout)
+}
 
-const (
-	modeRandom playMode = iota
-	modeEscalation
-)
+// pendingApproval is a buffered channel for at most one pending request.
+var pendingApproval = make(chan ApprovalRequest, 1)
 
 type soundPack struct {
 	name  string
 	fs    embed.FS
 	dir   string
-	mode  playMode
 	files []string
 }
 
@@ -80,87 +87,25 @@ func (sp *soundPack) loadFiles() error {
 	return nil
 }
 
-type slapTracker struct {
-	mu     sync.Mutex
-	times  []time.Time
-	window time.Duration
-	pack   *soundPack
-	altIdx int
-}
-
-func newSlapTracker(pack *soundPack) *slapTracker {
-	return &slapTracker{
-		window: 5 * time.Minute,
-		pack:   pack,
-	}
-}
-
-func (st *slapTracker) record(t time.Time) int {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-
-	cutoff := t.Add(-st.window)
-	newTimes := make([]time.Time, 0, len(st.times)+1)
-	for _, tt := range st.times {
-		if tt.After(cutoff) {
-			newTimes = append(newTimes, tt)
-		}
-	}
-	newTimes = append(newTimes, t)
-	st.times = newTimes
-	return len(st.times)
-}
-
-func (st *slapTracker) getFile(count int) string {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-
-	if len(st.pack.files) == 0 {
+func (sp *soundPack) randomFile() string {
+	if len(sp.files) == 0 {
 		return ""
 	}
-
-	if st.pack.mode == modeRandom {
-		return st.pack.files[rand.Intn(len(st.pack.files))]
-	}
-
-	// Escalation mode
-	maxIdx := len(st.pack.files) - 1
-	topTwo := maxIdx - 1
-	if topTwo < 0 {
-		topTwo = 0
-	}
-
-	var idx int
-	if count >= 20 {
-		st.altIdx = 1 - st.altIdx
-		idx = topTwo + st.altIdx
-	} else {
-		ratio := float64(count) / 20.0
-		if ratio > 1 {
-			ratio = 1
-		}
-		idx = int(ratio * float64(topTwo))
-	}
-
-	if idx > maxIdx {
-		idx = maxIdx
-	}
-	return st.pack.files[idx]
+	return sp.files[rand.Intn(len(sp.files))]
 }
 
 func main() {
 	cmd := &cobra.Command{
 		Use:   "spank",
-		Short: "Yells 'ow!' when you slap the laptop",
-		Long: `spank reads the Apple Silicon accelerometer directly via IOKit HID
-and plays audio responses when a slap or hit is detected.
+		Short: "Approve Claude Code actions by slapping your laptop",
+		Long: `spank-claude reads the Apple Silicon accelerometer via IOKit HID
+and runs an HTTP server for Claude Code PermissionRequest hooks.
 
-Requires sudo (for IOKit HID access to the accelerometer).
+When Claude Code requests permission, spank plays a notification sound
+and waits for a physical slap on the laptop. A detected slap approves
+the action and plays a sound from the selected pack.
 
-Use --sexy for a different experience. In sexy mode, the more you slap
-within a minute, the more intense the sounds become.
-
-Use --halo to play random audio clips from Halo soundtracks on each slap.`,
+Requires sudo (for IOKit HID access to the accelerometer).`,
 		Version: version,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return run(cmd.Context())
@@ -168,12 +113,103 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 		SilenceUsage: true,
 	}
 
-	cmd.Flags().BoolVarP(&sexyMode, "sexy", "s", false, "Enable sexy mode")
-	cmd.Flags().BoolVarP(&haloMode, "halo", "H", false, "Enable halo mode")
+	cmd.Flags().IntVar(&port, "port", 19222, "HTTP server port")
+	cmd.Flags().StringVar(&soundPkgF, "sound", "pain", "Sound pack for approval: pain, sexy, or halo")
 
 	if err := fang.Execute(context.Background(), cmd); err != nil {
 		os.Exit(1)
 	}
+}
+
+// hookRequest is the JSON body Claude Code sends to the hook endpoint.
+type hookRequest struct {
+	HookEventName string          `json:"hook_event_name"`
+	ToolName      string          `json:"tool_name"`
+	ToolInput     json.RawMessage `json:"tool_input"`
+}
+
+// hookResponse is the JSON body we return to approve an action.
+type hookResponse struct {
+	HookSpecificOutput hookOutput `json:"hookSpecificOutput"`
+}
+
+type hookOutput struct {
+	HookEventName string   `json:"hookEventName"`
+	Decision      decision `json:"decision"`
+}
+
+type decision struct {
+	Behavior string `json:"behavior"`
+}
+
+func hookHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req hookRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// Bad request — return empty 200 so Claude falls back to terminal prompt.
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if req.HookEventName != "PermissionRequest" {
+		// Not a permission request — return empty 200.
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	fmt.Printf("hook: permission request for tool=%s, waiting for slap...\n", req.ToolName)
+
+	// Play notification sound.
+	go playEmbedded(notifyAudio, "audio/notify/waiting.mp3")
+
+	// Create approval request.
+	respCh := make(chan string, 1)
+	approval := ApprovalRequest{
+		ToolName: req.ToolName,
+		Response: respCh,
+	}
+
+	// Try to enqueue — if channel is full (another request pending), fallback.
+	select {
+	case pendingApproval <- approval:
+		// Queued successfully.
+	default:
+		// Already a pending request — return empty 200 (fallback to terminal).
+		fmt.Println("hook: another request already pending, falling back to terminal")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Wait for slap or timeout.
+	select {
+	case result := <-respCh:
+		if result == "allow" {
+			resp := hookResponse{
+				HookSpecificOutput: hookOutput{
+					HookEventName: "PermissionRequest",
+					Decision:      decision{Behavior: "allow"},
+				},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(resp)
+			fmt.Printf("hook: approved tool=%s via slap!\n", req.ToolName)
+			return
+		}
+	case <-time.After(30 * time.Second):
+		// Drain the pending request so the main loop doesn't hold a stale one.
+		select {
+		case <-pendingApproval:
+		default:
+		}
+		fmt.Printf("hook: timeout waiting for slap (tool=%s), falling back to terminal\n", req.ToolName)
+	}
+
+	// Timeout or empty result — return empty 200.
+	w.WriteHeader(http.StatusOK)
 }
 
 func run(ctx context.Context) error {
@@ -181,18 +217,16 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("spank requires root privileges for accelerometer access, run with: sudo spank")
 	}
 
-	if sexyMode && haloMode {
-		return fmt.Errorf("--sexy and --halo are mutually exclusive; pick one")
-	}
-
 	var pack *soundPack
-	switch {
-	case sexyMode:
-		pack = &soundPack{name: "sexy", fs: sexyAudio, dir: "audio/sexy", mode: modeEscalation}
-	case haloMode:
-		pack = &soundPack{name: "halo", fs: haloAudio, dir: "audio/halo", mode: modeRandom}
+	switch soundPkgF {
+	case "sexy":
+		pack = &soundPack{name: "sexy", fs: sexyAudio, dir: "audio/sexy"}
+	case "halo":
+		pack = &soundPack{name: "halo", fs: haloAudio, dir: "audio/halo"}
+	case "pain":
+		pack = &soundPack{name: "pain", fs: painAudio, dir: "audio/pain"}
 	default:
-		pack = &soundPack{name: "pain", fs: painAudio, dir: "audio/pain", mode: modeRandom}
+		return fmt.Errorf("unknown sound pack %q, choose: pain, sexy, or halo", soundPkgF)
 	}
 
 	if err := pack.loadFiles(); err != nil {
@@ -211,8 +245,6 @@ func run(ctx context.Context) error {
 	defer accelRing.Unlink()
 
 	// Start the sensor worker in a background goroutine.
-	// sensor.Run() needs runtime.LockOSThread for CFRunLoop, which it
-	// handles internally. We launch detection on the current goroutine.
 	go func() {
 		close(sensorReady)
 		err := sensor.Run(sensor.Config{
@@ -236,8 +268,28 @@ func run(ctx context.Context) error {
 	// Give the sensor a moment to start producing data.
 	time.Sleep(100 * time.Millisecond)
 
-	tracker := newSlapTracker(pack)
-	speakerInit := false
+	// Start HTTP server.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hook", hookHandler)
+
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	server := &http.Server{Addr: addr, Handler: mux}
+
+	go func() {
+		fmt.Printf("spank: HTTP server listening on %s (sound=%s)\n", addr, pack.name)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "HTTP server error: %v\n", err)
+		}
+	}()
+
+	// Shut down HTTP server on context cancel.
+	go func() {
+		<-ctx.Done()
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutCancel()
+		server.Shutdown(shutCtx)
+	}()
+
 	det := detector.New()
 	var lastAccelTotal uint64
 	var lastEventTime time.Time
@@ -245,7 +297,7 @@ func run(ctx context.Context) error {
 	cooldown := 500 * time.Millisecond
 	maxBatch := 200
 
-	fmt.Printf("spank: listening for slaps in %s mode... (ctrl+c to quit)\n", pack.name)
+	fmt.Printf("spank: listening for slaps (sound=%s, port=%d)... ctrl+c to quit\n", pack.name, port)
 
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -283,10 +335,17 @@ func run(ctx context.Context) error {
 				if time.Since(lastYell) > cooldown {
 					if ev.Severity == "CHOC_MAJEUR" || ev.Severity == "CHOC_MOYEN" || ev.Severity == "MICRO_CHOC" {
 						lastYell = now
-						count := tracker.record(now)
-						file := tracker.getFile(count)
-						fmt.Printf("slap #%d [%s amp=%.5fg] -> %s\n", count, ev.Severity, ev.Amplitude, file)
-						go playEmbedded(pack.fs, file, &speakerInit)
+
+						// Check if there's a pending approval request.
+						select {
+						case approval := <-pendingApproval:
+							file := pack.randomFile()
+							fmt.Printf("slap detected [%s amp=%.5fg] -> approved! playing %s\n", ev.Severity, ev.Amplitude, file)
+							go playEmbedded(pack.fs, file)
+							approval.Response <- "allow"
+						default:
+							// No pending request — ignore the slap silently.
+						}
 					}
 				}
 			}
@@ -295,8 +354,9 @@ func run(ctx context.Context) error {
 }
 
 var speakerMu sync.Mutex
+var speakerInit bool
 
-func playEmbedded(fs embed.FS, path string, speakerInit *bool) {
+func playEmbedded(fs embed.FS, path string) {
 	data, err := fs.ReadFile(path)
 	if err != nil {
 		return
@@ -309,9 +369,9 @@ func playEmbedded(fs embed.FS, path string, speakerInit *bool) {
 	defer streamer.Close()
 
 	speakerMu.Lock()
-	if !*speakerInit {
+	if !speakerInit {
 		speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
-		*speakerInit = true
+		speakerInit = true
 	}
 	speakerMu.Unlock()
 

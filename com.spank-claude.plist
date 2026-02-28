@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.spank-claude</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/spank</string>
+        <string>--sound</string>
+        <string>sexy</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/spank-claude.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/spank-claude.log</string>
+</dict>
+</plist>
